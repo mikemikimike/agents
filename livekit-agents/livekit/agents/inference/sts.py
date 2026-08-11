@@ -631,6 +631,9 @@ class STSSession(llm.RealtimeSession):
             elif event_type == "response.done":
                 self._handle_response_done(data)
 
+            elif event_type == "session.failover":
+                self._handle_session_failover(data)
+
             elif event_type == "error":
                 err_data = data.get("error", {})
                 err_msg = err_data.get("message", str(data))
@@ -651,6 +654,28 @@ class STSSession(llm.RealtimeSession):
                         recoverable=True,
                     ),
                 )
+
+    def _handle_session_failover(self, data: dict[str, Any]) -> None:
+        # The gateway moved the call to another deployment because the one
+        # serving it died. Our socket is untouched, so this notice is the only
+        # way to find out — and without acting on it the agent goes on talking
+        # to a model that has no memory of the conversation.
+        #
+        # The gateway replays the session config it was given; everything
+        # tracked on this side (tools, tool_choice, chat history) has to be
+        # re-sent, which is the same work a dropped socket needs, so it shares
+        # the reconnect path.
+        if not data.get("context_lost", True):
+            return
+
+        logger.warning(
+            "STS: provider failed over, replaying conversation onto the new session "
+            "(model=%s, reason=%s)",
+            data.get("model", ""),
+            data.get("reason", ""),
+        )
+        self._replay_session_state()
+        self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
 
     def _handle_input_audio_transcription_delta(self, data: dict[str, Any]) -> None:
         # OpenAI streams the user transcript incrementally as .delta events before

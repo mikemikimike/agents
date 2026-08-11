@@ -230,6 +230,51 @@ async def test_replay_session_state_resets_and_requeues():
 
 
 @pytest.mark.asyncio
+async def test_session_failover_replays_conversation():
+    """The gateway can move the call to another deployment without our socket
+    ever dropping. The replacement has no conversation, so the notice has to
+    trigger the same replay a reconnect does — otherwise the agent keeps talking
+    to a model that has forgotten the call."""
+    session = _make_session()
+    session._connected = True
+    session._ws = object()
+
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="user", content="book me a table for four")
+    session._chat_ctx = chat_ctx
+
+    reconnected: list[llm.RealtimeSessionReconnectedEvent] = []
+    session.on("session_reconnected", reconnected.append)
+
+    session._handle_session_failover(
+        {"type": "session.failover", "model": "gpt-realtime-2", "reason": "provider_unavailable"}
+    )
+
+    replayed = [session._msg_ch.recv_nowait() for _ in range(session._msg_ch.qsize())]
+    assert any(ev["type"] == "conversation.item.create" for ev in replayed), (
+        "the conversation must be rebuilt on the replacement provider"
+    )
+    assert len(reconnected) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_failover_without_context_loss_is_quiet():
+    """context_lost is the whole payload of the notice. A handoff that preserves
+    the conversation must not re-send it, or the model sees every turn twice."""
+    session = _make_session()
+    session._connected = True
+    session._ws = object()
+
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="user", content="hello")
+    session._chat_ctx = chat_ctx
+
+    session._handle_session_failover({"type": "session.failover", "context_lost": False})
+
+    assert session._msg_ch.qsize() == 0
+
+
+@pytest.mark.asyncio
 async def test_sent_fnc_outputs_survives_replay():
     """Replay re-creates tool outputs from the recorded context, so the sent-set
     must not be cleared or update_chat_ctx would send each output twice."""
