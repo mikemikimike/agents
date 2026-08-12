@@ -30,6 +30,19 @@ if TYPE_CHECKING:
     from .turn import TurnDetectionMode
 
 
+def _resolve_llm_model_string(model: str) -> llm.LLM | llm.RealtimeModel:
+    """Resolve an ``llm="…"`` string to an inference model.
+
+    Realtime model names resolve to a speech-to-speech session rather than an
+    ordinary LLM. Shared by the constructor and update_options, which is the
+    point: when only the constructor knew about realtime names, swapping to one
+    mid-agent silently produced a text LLM that could not speak.
+    """
+    if inference.is_realtime_model(model):
+        return inference.STS.from_model_string(model)
+    return inference.LLM.from_model_string(model)
+
+
 @dataclass
 class ModelSettings:
     tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN
@@ -85,10 +98,7 @@ class Agent:
             stt = inference.STT.from_model_string(stt)
 
         if isinstance(llm, str):
-            if llm.startswith(("openai/gpt-realtime", "gpt-realtime")):
-                llm = inference.STS.from_model_string(llm)
-            else:
-                llm = inference.LLM.from_model_string(llm)
+            llm = _resolve_llm_model_string(llm)
 
         if isinstance(tts, str):
             tts = inference.TTS.from_model_string(tts)
@@ -285,7 +295,7 @@ class Agent:
         if isinstance(stt, str):
             stt = inference.STT.from_model_string(stt)
         if isinstance(llm, str):
-            llm = inference.LLM.from_model_string(llm)
+            llm = _resolve_llm_model_string(llm)
         if isinstance(tts, str):
             tts = inference.TTS.from_model_string(tts)
 

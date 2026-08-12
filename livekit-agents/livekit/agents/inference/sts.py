@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import json
 import os
 import time
@@ -38,6 +39,9 @@ NUM_CHANNELS = 1
 _RECONNECT_MAX_RETRIES = 3
 _RECONNECT_BASE_BACKOFF = 1.0
 
+# How long to wait for the gateway to accept the WebSocket upgrade.
+_CONNECT_TIMEOUT = 30.0
+
 # OpenAI Realtime caps a session at ~30 minutes. Proactively recycle the
 # connection before that hard cap so a fresh session is established at a quiet
 # point (between turns) instead of the server dropping mid-response. Matches the
@@ -51,6 +55,73 @@ _DEFAULT_MAX_SESSION_DURATION = 20 * 60
 # reach the transcript or history. Matches the openai realtime plugin's
 # DEFAULT_INPUT_AUDIO_TRANSCRIPTION.
 _DEFAULT_INPUT_AUDIO_TRANSCRIPTION: dict[str, Any] = {"model": "gpt-4o-mini-transcribe"}
+
+# Realtime model ids the inference gateway serves, matched on prefix so a new
+# point release (gpt-realtime-2.1) needs no change here.
+_REALTIME_MODEL_PREFIXES = ("gpt-realtime",)
+_REALTIME_MODEL_PROVIDER = "openai"
+
+# How many events may be held while the socket is down. A reconnect takes a few
+# seconds at most, so this only has to cover a turn's worth of requests.
+_MAX_DEFERRED_EVENTS = 64
+
+
+def is_realtime_model(model: str) -> bool:
+    """Report whether a model string names a speech-to-speech realtime model.
+
+    Used to decide whether ``llm="…"`` resolves to STS or to an ordinary LLM.
+    Accepts the bare form as well as the provider-prefixed one, because that is
+    what people type.
+    """
+    _, _, name = model.rpartition("/")
+    return name.startswith(_REALTIME_MODEL_PREFIXES)
+
+
+def _normalize_model(model: str) -> str:
+    """Add the provider prefix a bare realtime model id is missing.
+
+    Every other inference modality documents ``provider/model`` and the gateway
+    resolves nothing else: a bare "gpt-realtime" tokenizes as the provider
+    "gpt-realtime" with no model and fails the session. Accepting the bare form
+    and repairing it here is what keeps ``AgentSession(llm="gpt-realtime")``
+    working, which is the form the docs use.
+    """
+    if "/" in model:
+        return model
+    return f"{_REALTIME_MODEL_PROVIDER}/{model}"
+
+
+# Codes that will fail identically on the next turn, so a session carrying one is
+# not worth keeping alive. Matches the openai realtime plugin's set.
+_FATAL_ERROR_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "invalid_api_key",
+        "account_deactivated",
+        "billing_hard_limit_reached",
+    }
+)
+
+
+def _decode_error(data: dict[str, Any]) -> tuple[str, str]:
+    """Pull the message and code out of an error frame, in either shape.
+
+    Provider errors arrive nested as OpenAI sends them
+    (``{"error": {"message", "code"}}``); the ones the gateway raises itself are
+    flat (``{"type": "error", "code", "message"}``). Reading only the nested form
+    reduced every gateway error to the repr of the whole frame and lost the code
+    that says whether the session can continue.
+    """
+    nested = data.get("error")
+    if isinstance(nested, dict):
+        message = nested.get("message") or ""
+        code = nested.get("code") or nested.get("type") or ""
+        if message or code:
+            return message or str(data), str(code)
+
+    message = data.get("message") or ""
+    code = data.get("code") or ""
+    return (message or str(data)), str(code)
 
 
 def _build_tool_defs(tools: list[llm.Tool]) -> list[dict[str, Any]]:
@@ -135,7 +206,7 @@ class _STSOptions:
     model: str
     voice: str
     instructions: str
-    modalities: list[str]
+    modalities: list[Literal["text", "audio"]]
     base_url: str
     api_key: str
     api_secret: str
@@ -170,7 +241,7 @@ class STS(llm.RealtimeModel):
         *,
         voice: NotGivenOr[str] = NOT_GIVEN,
         instructions: str = "",
-        modalities: list[str] | None = None,
+        modalities: list[Literal["text", "audio"]] | None = None,
         temperature: float | None = None,  # deprecated, ignored by GA Realtime
         turn_detection: NotGivenOr[dict[str, Any] | None] = NOT_GIVEN,
         input_audio_transcription: NotGivenOr[dict[str, Any] | None] = NOT_GIVEN,
@@ -206,8 +277,13 @@ class STS(llm.RealtimeModel):
                 # openai realtime plugin). True would leave tool calls hanging until
                 # the pipeline's 5s auto-reply timeout.
                 auto_tool_reply_generation=False,
-                audio_output=True,
+                audio_output="audio" in (modalities or ["text", "audio"]),
                 manual_function_calls=False,
+                # The pipeline may substitute its own turn detection, but only
+                # when the caller didn't ask for a specific one — an explicit
+                # turn_detection is a decision, not a default to override.
+                # Applied per session (see session), so the model stays reusable.
+                can_disable_turn_detection=not is_given(turn_detection),
                 # instructions and tools are updatable mid-session via session.update
                 # (update_instructions/update_tools), which lets agent handoff patch
                 # the live session instead of tearing it down and reconnecting.
@@ -238,7 +314,7 @@ class STS(llm.RealtimeModel):
             )
 
         self._opts = _STSOptions(
-            model=model,
+            model=_normalize_model(model),
             voice=voice if is_given(voice) else "alloy",
             instructions=instructions,
             modalities=modalities or ["text", "audio"],
@@ -265,22 +341,37 @@ class STS(llm.RealtimeModel):
     def provider(self) -> str:
         return "livekit"
 
-    def session(self) -> STSSession:
-        return STSSession(self)
+    def session(self, *, turn_detection_disabled: bool = False) -> STSSession:
+        return STSSession(self, turn_detection_disabled=turn_detection_disabled)
 
     async def aclose(self) -> None:
         pass
 
 
 class STSSession(llm.RealtimeSession):
-    def __init__(self, realtime_model: STS) -> None:
+    def __init__(self, realtime_model: STS, *, turn_detection_disabled: bool = False) -> None:
         super().__init__(realtime_model)
         self._model: STS = realtime_model
-        self._opts = realtime_model._opts
+        # Per-session copy: update_instructions and a pipeline-disabled turn
+        # detection both change these, and the model is documented as reusable
+        # across sessions. Sharing the model's options let one session's
+        # instructions leak into the next.
+        self._opts = dataclasses.replace(realtime_model._opts)
+        if turn_detection_disabled:
+            # None serialises as JSON null, which the realtime API reads as
+            # manual turns. Omitting the field instead would let the gateway
+            # apply its server_vad default and re-enable the very thing the
+            # pipeline turned off to run its own turn detection.
+            self._opts.turn_detection = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._http_session: aiohttp.ClientSession | None = None
         self._chat_ctx = llm.ChatContext.empty()
-        self._tools = llm.ToolContext.empty()
+        # ids of the items the provider is known to hold, either because it
+        # produced them or because we sent them. Cleared whenever the session
+        # moves to a fresh socket, which is what makes the replay re-send
+        # everything. Without it there is no way to tell an item the model
+        # already has from one it has never been told about.
+        self._remote_item_ids: set[str] = set()
         # Tracks the last tool_choice pushed via update_options (stored in the
         # realtime wire form) so we only emit a session.update when it actually
         # changes. "auto" is the realtime default, so a no-op update stays silent.
@@ -297,6 +388,10 @@ class STSSession(llm.RealtimeSession):
         # accumulates the agent's own output text per item_id, so a completed
         # assistant turn can be recorded in _chat_ctx for replay after a reconnect.
         self._output_transcripts: dict[str, str] = {}
+        # what the caller actually heard of an interrupted assistant turn, keyed
+        # by item_id. Overrides the accumulated transcript when the turn is
+        # recorded (see truncate).
+        self._truncated_transcripts: dict[str, str] = {}
         self._recv_task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         # _started: lifecycle tasks have been launched (stays True across
@@ -309,6 +404,13 @@ class STSSession(llm.RealtimeSession):
 
         self._current_generation: _ResponseGeneration | None = None
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
+        # client_event_ids whose generate_reply was cancelled before the provider
+        # acknowledged it. A response.created already in flight for one of these
+        # is dropped instead of being spoken after the interruption.
+        self._discarded_event_ids: set[str] = set()
+        # events the send pump could not deliver because the socket was down,
+        # re-queued after the replay once it is back (see _defer_event).
+        self._deferred_events: list[dict[str, Any]] = []
         # Set whenever no generation is in flight. The session-recycle timer waits
         # on this so a proactive reconnect happens between turns, never mid-response.
         self._generation_done = asyncio.Event()
@@ -324,7 +426,7 @@ class STSSession(llm.RealtimeSession):
     def chat_ctx(self) -> llm.ChatContext:
         return self._chat_ctx.copy()
 
-    def _record_item(self, item: llm.ChatItem) -> None:
+    def _record_item(self, item: llm.ChatItem, *, remote: bool = False) -> None:
         """Track a completed conversation item so it can be replayed on reconnect.
 
         The realtime session's history lives on the provider and is lost when the
@@ -332,14 +434,23 @@ class STSSession(llm.RealtimeSession):
         (max_session_duration), not just on error. Keeping a local copy is also
         what makes ``chat_ctx`` return something to callers that read history off
         the session (``generate_reply(user_input=...)`` builds on it).
+
+        ``remote`` marks an item the provider already holds because it produced
+        it — its own reply, a tool call it asked for, a transcript from its own
+        ASR. Those must not be sent back to it, and everything else must be.
         """
+        if remote and item.id:
+            self._remote_item_ids.add(item.id)
         if item.id and self._chat_ctx.get_by_id(item.id) is not None:
             return
         self._chat_ctx.items.append(item)
 
     @property
     def tools(self) -> llm.ToolContext:
-        return self._tools
+        # The tools currently in force, which is what the pipeline saves and
+        # restores around a per-turn override. Returning a stale set made that
+        # save-and-restore clear the agent's tools for the rest of the call.
+        return llm.ToolContext(self._current_tools)
 
     async def _connect(self) -> None:
         if self._started:
@@ -380,10 +491,16 @@ class STSSession(llm.RealtimeSession):
         }
 
         try:
-            self._ws = await self._http_session.ws_connect(
-                f"{base_url}/sts?model={self._opts.model}",
-                headers=headers,
-                timeout=30,
+            # asyncio.wait_for rather than ws_connect's own timeout=, matching
+            # the STT and TTS siblings: aiohttp's kwarg takes a ClientWSTimeout,
+            # where a bare number silently means something narrower than "give
+            # up on the connect after this long".
+            self._ws = await asyncio.wait_for(
+                self._http_session.ws_connect(
+                    f"{base_url}/sts?model={self._opts.model}",
+                    headers=headers,
+                ),
+                _CONNECT_TIMEOUT,
             )
         except aiohttp.ClientResponseError as e:
             raise APIConnectionError(f"STS connection failed: {e.message}") from e
@@ -424,9 +541,8 @@ class STSSession(llm.RealtimeSession):
             data = json.loads(msg.data)
             msg_type = data.get("type", "")
             if msg_type == "error":
-                raise APIError(
-                    f"STS session creation failed: {data.get('message', data.get('error', {}).get('message', ''))}"
-                )
+                err_msg, err_code = _decode_error(data)
+                raise APIError(f"STS session creation failed: {err_msg} (code={err_code})")
             if msg_type != "session.created":
                 logger.warning("STS: expected session.created, got %s", msg_type)
         else:
@@ -524,9 +640,29 @@ class STSSession(llm.RealtimeSession):
                     llm.RealtimeError("pending response discarded due to session reconnection")
                 )
         self._response_created_futures.clear()
+        # A turn that was mid-flight is cut off here. Closing its channels quietly
+        # would present the half-spoken reply to the pipeline as a finished one,
+        # leaving the caller with a sentence that stops and then silence, with
+        # nothing anywhere saying why. There is no re-speak hook for realtime
+        # turns, so it is reported instead: an error the app can hear is the most
+        # the SDK can honestly offer.
+        if self._current_generation is not None:
+            self.emit(
+                "error",
+                llm.RealtimeModelError(
+                    timestamp=time.time(),
+                    label="sts",
+                    error=APIError("response interrupted by session reconnection"),
+                    recoverable=True,
+                ),
+            )
         self._close_current_generation()
         self._input_transcripts.clear()
         self._output_transcripts.clear()
+        self._truncated_transcripts.clear()
+        self._discarded_event_ids.clear()
+        # The new provider holds nothing until the replay below puts it back.
+        self._remote_item_ids.clear()
 
         # session.create (in _establish_ws) already re-applied instructions, voice,
         # modalities and turn detection from _opts. Tools and tool_choice ride on
@@ -558,6 +694,11 @@ class STSSession(llm.RealtimeSession):
             if event is None:
                 continue
             self._queue_event({"type": "conversation.item.create", "item": event})
+            self._remote_item_ids.add(item.id)
+
+        # Only now: whatever the client asked for during the gap belongs after the
+        # conversation it refers to.
+        self._flush_deferred_events()
 
     async def _read_ws(self) -> None:
         if not self._ws:
@@ -585,75 +726,81 @@ class STSSession(llm.RealtimeSession):
             except json.JSONDecodeError:
                 continue
 
-            event_type = data.get("type", "")
+            self._handle_event(data)
 
-            if event_type == "input_audio_buffer.speech_started":
-                self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+    def _handle_event(self, data: dict[str, Any]) -> None:
+        event_type = data.get("type", "")
 
-            elif event_type == "input_audio_buffer.speech_stopped":
-                self.emit(
-                    "input_speech_stopped",
-                    llm.InputSpeechStoppedEvent(
-                        user_transcription_enabled=self._opts.input_audio_transcription is not None
-                    ),
-                )
+        if event_type == "input_audio_buffer.speech_started":
+            self.emit("input_speech_started", llm.InputSpeechStartedEvent())
 
-            elif event_type == "conversation.item.input_audio_transcription.delta":
-                self._handle_input_audio_transcription_delta(data)
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self.emit(
+                "input_speech_stopped",
+                llm.InputSpeechStoppedEvent(
+                    user_transcription_enabled=self._opts.input_audio_transcription is not None
+                ),
+            )
 
-            elif event_type == "conversation.item.input_audio_transcription.completed":
-                self._handle_input_audio_transcription_completed(data)
+        elif event_type == "conversation.item.input_audio_transcription.delta":
+            self._handle_input_audio_transcription_delta(data)
 
-            elif event_type == "conversation.item.input_audio_transcription.failed":
-                self._handle_input_audio_transcription_failed(data)
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            self._handle_input_audio_transcription_completed(data)
 
-            elif event_type == "response.created":
-                self._handle_response_created(data)
+        elif event_type == "conversation.item.input_audio_transcription.failed":
+            self._handle_input_audio_transcription_failed(data)
 
-            elif event_type == "response.output_item.added":
-                self._handle_response_output_item_added(data)
+        elif event_type == "response.created":
+            self._handle_response_created(data)
 
-            elif event_type == "response.content_part.added":
-                self._handle_response_content_part_added(data)
+        elif event_type == "response.output_item.added":
+            self._handle_response_output_item_added(data)
 
-            elif event_type == "response.output_audio.delta":
-                self._handle_response_audio_delta(data)
+        elif event_type == "response.content_part.added":
+            self._handle_response_content_part_added(data)
 
-            elif event_type == "response.output_audio_transcript.delta":
-                self._handle_response_text_delta(data)
+        elif event_type == "response.output_audio.delta":
+            self._handle_response_audio_delta(data)
 
-            elif event_type == "response.output_text.delta":
-                self._handle_response_text_delta(data)
+        elif event_type == "response.output_audio_transcript.delta":
+            self._handle_response_text_delta(data)
 
-            elif event_type == "response.output_item.done":
-                self._handle_response_output_item_done(data)
+        elif event_type == "response.output_text.delta":
+            self._handle_response_text_delta(data)
 
-            elif event_type == "response.done":
-                self._handle_response_done(data)
+        elif event_type == "response.output_item.done":
+            self._handle_response_output_item_done(data)
 
-            elif event_type == "session.failover":
-                self._handle_session_failover(data)
+        elif event_type == "response.done":
+            self._handle_response_done(data)
 
-            elif event_type == "error":
-                err_data = data.get("error", {})
-                err_msg = err_data.get("message", str(data))
-                # "Cancellation failed: no active response" is a benign race: an
-                # interrupt() sent response.cancel just as the response ended, so
-                # there is nothing to cancel and nothing to recover. OpenAI reports
-                # it as an error; drop it instead of surfacing a scary log line
-                # (mirrors the openai realtime plugin's _handle_error).
-                if err_msg.startswith("Cancellation failed"):
-                    continue
-                logger.warning("STS error: %s", err_msg)
-                self.emit(
-                    "error",
-                    llm.RealtimeModelError(
-                        timestamp=time.time(),
-                        label="sts_error",
-                        error=APIError(err_msg),
-                        recoverable=True,
-                    ),
-                )
+        elif event_type == "session.failover":
+            self._handle_session_failover(data)
+
+        elif event_type == "error":
+            err_msg, err_code = _decode_error(data)
+            # "Cancellation failed: no active response" is a benign race: an
+            # interrupt() sent response.cancel just as the response ended, so
+            # there is nothing to cancel and nothing to recover. OpenAI reports
+            # it as an error; drop it instead of surfacing a scary log line
+            # (mirrors the openai realtime plugin's _handle_error).
+            if err_msg.startswith("Cancellation failed"):
+                return
+            logger.warning("STS error: %s (code=%s)", err_msg, err_code)
+            self.emit(
+                "error",
+                llm.RealtimeModelError(
+                    timestamp=time.time(),
+                    label="sts_error",
+                    error=APIError(err_msg),
+                    # A quota, auth or billing failure will fail identically
+                    # on every subsequent turn, so it is reported as fatal and
+                    # the caller is spared a session that can only keep
+                    # failing. Everything else is assumed transient.
+                    recoverable=err_code not in _FATAL_ERROR_CODES,
+                ),
+            )
 
     def _handle_session_failover(self, data: dict[str, Any]) -> None:
         # The gateway moved the call to another deployment because the one
@@ -706,7 +853,11 @@ class STSSession(llm.RealtimeSession):
         self._input_transcripts.pop(item_id, None)
         transcript = data.get("transcript", "")
         if transcript:
-            self._record_item(llm.ChatMessage(id=item_id, role="user", content=[transcript]))
+            # The provider transcribed its own input audio, so the item is
+            # already in its conversation.
+            self._record_item(
+                llm.ChatMessage(id=item_id, role="user", content=[transcript]), remote=True
+            )
         self.emit(
             "input_audio_transcription_completed",
             llm.InputTranscriptionCompleted(
@@ -718,17 +869,41 @@ class STSSession(llm.RealtimeSession):
 
     def _handle_input_audio_transcription_failed(self, data: dict[str, Any]) -> None:
         # Transcription is best-effort: a failure means the user's turn has no
-        # transcript, but the audio turn itself is unaffected, so log and drop the
-        # partial rather than tearing down the session.
+        # final transcript, but the audio turn itself is unaffected, so the
+        # session carries on.
+        #
+        # Whatever partial arrived is closed out as final rather than dropped.
+        # Captioning and history consumers have already been handed interim text
+        # for this item and have no other way to learn it is finished; dropping it
+        # leaves the last thing the user said displayed as a partial forever.
+        # Matches the openai realtime plugin.
         item_id = data.get("item_id", "")
-        self._input_transcripts.pop(item_id, None)
+        partial = self._input_transcripts.pop(item_id, "")
         err = data.get("error", {})
         err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         logger.warning("STS: input audio transcription failed: %s", err_msg)
 
+        if not partial:
+            return
+        self._record_item(llm.ChatMessage(id=item_id, role="user", content=[partial]), remote=True)
+        self.emit(
+            "input_audio_transcription_completed",
+            llm.InputTranscriptionCompleted(item_id=item_id, transcript=partial, is_final=True),
+        )
+
     def _handle_response_created(self, data: dict[str, Any]) -> None:
         response = data.get("response", {})
         response_id = response.get("id", "")
+
+        metadata = response.get("metadata", {})
+        client_event_id = metadata.get("client_event_id", "") if isinstance(metadata, dict) else ""
+        if client_event_id and client_event_id in self._discarded_event_ids:
+            # The caller interrupted before this reply existed. Cancel it again —
+            # the first cancel raced the creation — and don't announce it, so the
+            # pipeline never gets a turn it already abandoned.
+            self._discarded_event_ids.discard(client_event_id)
+            self._queue_event({"type": "response.cancel"})
+            return
 
         self._current_generation = _ResponseGeneration(
             message_ch=utils.aio.Chan(),
@@ -747,14 +922,11 @@ class STSSession(llm.RealtimeSession):
             response_id=response_id,
         )
 
-        metadata = response.get("metadata", {})
-        if isinstance(metadata, dict):
-            client_event_id = metadata.get("client_event_id", "")
-            if client_event_id and client_event_id in self._response_created_futures:
-                fut = self._response_created_futures.pop(client_event_id)
-                if not fut.done():
-                    generation_ev.user_initiated = True
-                    fut.set_result(generation_ev)
+        if client_event_id and client_event_id in self._response_created_futures:
+            fut = self._response_created_futures.pop(client_event_id)
+            if not fut.done():
+                generation_ev.user_initiated = True
+                fut.set_result(generation_ev)
 
         self.emit("generation_created", generation_ev)
 
@@ -863,13 +1035,20 @@ class STSSession(llm.RealtimeSession):
                     name=name,
                     arguments=arguments,
                 )
-                self._record_item(fnc)
+                self._record_item(fnc, remote=True)
                 self._current_generation.function_ch.send_nowait(fnc)
             return
 
+        # An interrupted turn was already trimmed to what the caller heard; the
+        # accumulated transcript includes words that were generated but never
+        # played.
         transcript = self._output_transcripts.pop(item_id, "")
+        if item_id in self._truncated_transcripts:
+            transcript = self._truncated_transcripts.pop(item_id)
         if transcript:
-            self._record_item(llm.ChatMessage(id=item_id, role="assistant", content=[transcript]))
+            self._record_item(
+                llm.ChatMessage(id=item_id, role="assistant", content=[transcript]), remote=True
+            )
 
         item_gen = self._current_generation.messages.get(item_id)
         if item_gen:
@@ -882,7 +1061,39 @@ class STSSession(llm.RealtimeSession):
 
     def _handle_response_done(self, data: dict[str, Any]) -> None:
         self._emit_usage_metrics(data)
+        # The channels close either way — leaving them open would hang the
+        # pipeline on a turn that is over — but a failed or truncated response is
+        # reported, because closing quietly makes a rate-limited turn
+        # indistinguishable from one where the model chose to say nothing.
+        # Matches the openai realtime plugin.
+        self._report_incomplete_response(data.get("response", {}))
         self._close_current_generation()
+
+    def _report_incomplete_response(self, response: dict[str, Any]) -> None:
+        status = response.get("status", "")
+        if status in ("", "completed", "cancelled"):
+            # A cancellation is an interruption the pipeline asked for.
+            return
+
+        details = response.get("status_details") or {}
+        message = f"STS response {status}"
+        if isinstance(details, dict):
+            error = details.get("error") or {}
+            if isinstance(error, dict) and (error.get("code") or error.get("type")):
+                message = f"{message}: [{error.get('type', '')}] {error.get('code', '')}".strip()
+            elif details.get("reason"):
+                message = f"{message}: {details['reason']}"
+
+        logger.warning("STS: %s", message)
+        self.emit(
+            "error",
+            llm.RealtimeModelError(
+                timestamp=time.time(),
+                label="sts",
+                error=APIError(message),
+                recoverable=True,
+            ),
+        )
 
     def _emit_usage_metrics(self, data: dict[str, Any]) -> None:
         response = data.get("response", {})
@@ -961,17 +1172,48 @@ class STSSession(llm.RealtimeSession):
         self._generation_done.set()
 
     async def _send_loop(self) -> None:
-        # Runs for the lifetime of the session across reconnects. While the socket
-        # is down (mid-reconnect) events are dropped rather than breaking the pump,
-        # so it survives to serve the re-established socket.
+        # Runs for the lifetime of the session across reconnects.
+        #
+        # While the socket is down, events are set aside instead of discarded: a
+        # reply the pipeline started during the reconnect window would otherwise
+        # be dropped and then failed, which reads to the caller as the agent going
+        # silent for a turn. They are re-queued *after* the replay
+        # (_replay_session_state) rather than held in place, so the replacement
+        # sees the conversation before it is asked to answer.
+        #
+        # Audio is the exception. It is real-time by nature: a second of speech
+        # delivered after the gap is worse than no speech, and it would arrive
+        # ahead of the history for the same reason.
         async for msg in self._msg_ch:
             if not self._connected or not self._ws:
+                self._defer_event(msg)
                 continue
             try:
                 await self._ws.send_str(json.dumps(msg))
             except Exception:
                 if not self._closing:
                     logger.warning("STS: failed to send event, connection closed")
+
+    def _defer_event(self, event: dict[str, Any]) -> None:
+        """Hold an event the current socket can no longer carry."""
+        if self._closing:
+            return
+        event_type = event.get("type", "")
+        if event_type.startswith("input_audio_buffer."):
+            return
+        if len(self._deferred_events) >= _MAX_DEFERRED_EVENTS:
+            # The reconnect budget is a few seconds; anything longer than this
+            # backlog means the session is not coming back, and replaying a
+            # minute of stale requests onto it would be worse than losing them.
+            logger.warning("STS: dropping event queued during reconnect, backlog full")
+            return
+        self._deferred_events.append(event)
+
+    def _flush_deferred_events(self) -> None:
+        """Re-queue what the reconnect window held, behind the replayed state."""
+        deferred, self._deferred_events = self._deferred_events, []
+        for event in deferred:
+            self._queue_event(event)
 
     def _queue_event(self, event: dict[str, Any]) -> None:
         with contextlib.suppress(utils.aio.channel.ChanClosed):
@@ -996,33 +1238,32 @@ class STSSession(llm.RealtimeSession):
         )
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
-        # Live history is owned by the provider, so this doesn't sync messages
-        # mid-session: function call outputs are the only items the model needs
-        # from the client (it can't produce a tool reply without them), so those
-        # are forwarded as conversation.item.create. This is the path the voice
-        # pipeline uses to deliver tool results to a realtime session.
+        # Everything the provider has not been told about goes over: the history
+        # a caller preloaded into AgentSession, the text of
+        # generate_reply(user_input=...), and the tool outputs a turn is waiting
+        # on. What the model produced itself is skipped — it already has those,
+        # and re-sending them would duplicate the turn it just took.
         #
-        # The caller's view is still recorded locally, because a reconnect replays
-        # this context onto the fresh session (_replay_session_state) and because
-        # callers read history back off chat_ctx.
+        # This is deliberately additive: the provider owns the live conversation,
+        # so removals and edits are not replayed the way the OpenAI plugin's
+        # diff does. The one edit that matters (an interrupted reply trimmed to
+        # what was actually played) is handled in truncate.
         for item in chat_ctx.items:
             self._record_item(item)
 
-            if not isinstance(item, llm.FunctionCallOutput):
+            if item.id in self._remote_item_ids:
                 continue
-            if item.call_id in self._sent_fnc_outputs:
+            if isinstance(item, llm.FunctionCallOutput) and item.call_id in self._sent_fnc_outputs:
+                self._remote_item_ids.add(item.id)
                 continue
-            self._sent_fnc_outputs.add(item.call_id)
-            await self._send(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": item.call_id,
-                        "output": item.output,
-                    },
-                }
-            )
+
+            event = _chat_item_to_realtime_item(item)
+            if event is None:
+                continue
+            if isinstance(item, llm.FunctionCallOutput):
+                self._sent_fnc_outputs.add(item.call_id)
+            self._remote_item_ids.add(item.id)
+            await self._send({"type": "conversation.item.create", "item": event})
 
     async def update_tools(self, tools: list[llm.Tool]) -> None:
         # Retain the tools so _replay_session_state can re-apply them after a
@@ -1130,7 +1371,22 @@ class STSSession(llm.RealtimeSession):
                 fut.set_exception(llm.RealtimeError("generate_reply timed out."))
 
         handle = asyncio.get_running_loop().call_later(10.0, _on_timeout)
-        fut.add_done_callback(lambda _: handle.cancel())
+
+        def _on_done(f: asyncio.Future[llm.GenerationCreatedEvent]) -> None:
+            handle.cancel()
+            self._response_created_futures.pop(event_id, None)
+            if not f.cancelled():
+                return
+            # The pipeline cancels this when the caller interrupts before the
+            # reply started. The provider hasn't heard about that, so without
+            # cancelling upstream it goes on to produce the reply and speak it
+            # over whatever the caller said instead. The id is remembered because
+            # response.created can already be in flight: when it lands it is
+            # discarded rather than emitted as a fresh unprompted turn.
+            self._discarded_event_ids.add(event_id)
+            self._queue_event({"type": "response.cancel"})
+
+        fut.add_done_callback(_on_done)
 
         return fut
 
@@ -1176,8 +1432,34 @@ class STSSession(llm.RealtimeSession):
                 }
             )
 
+        # The caller heard audio_transcript, not the whole reply the model
+        # generated. Trim the local record to what was actually played, because
+        # that record is what gets replayed onto a replacement provider: left
+        # alone, a recycle or failover would restore words the caller interrupted
+        # and never heard, and the model would answer as if it had said them.
+        #
+        # Remembered as well as applied, because the interrupted item may not be
+        # recorded yet: the pipeline truncates when playback stops, which can
+        # precede the response.output_item.done that records the turn.
+        if not is_given(audio_transcript):
+            return
+        self._truncated_transcripts[message_id] = audio_transcript
+        idx = self._chat_ctx.index_by_id(message_id)
+        if idx is None:
+            return
+        item = self._chat_ctx.items[idx]
+        if isinstance(item, llm.ChatMessage):
+            item.content = [audio_transcript]
+
     async def aclose(self) -> None:
         self._closing = True
+        # Fail anything still waiting on a reply. Left alone these sit until their
+        # ten-second timeout, holding the caller that awaited generate_reply well
+        # past the point the session stopped existing.
+        for fut in self._response_created_futures.values():
+            if not fut.done():
+                fut.set_exception(llm.RealtimeError("session closed"))
+        self._response_created_futures.clear()
         self._close_current_generation()
         self._msg_ch.close()
         if self._send_task and not self._send_task.done():

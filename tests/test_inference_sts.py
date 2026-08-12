@@ -1,9 +1,15 @@
 import asyncio
+import contextlib
 
 import pytest
 
 from livekit.agents import llm, utils
-from livekit.agents.inference.sts import STS, STSSession, _ResponseGeneration
+from livekit.agents.inference.sts import (
+    STS,
+    STSSession,
+    _decode_error,
+    _ResponseGeneration,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -16,6 +22,16 @@ def _make_session() -> STSSession:
         base_url="https://example.livekit.cloud",
     )
     return model.session()
+
+
+class _FakeWS:
+    """Enough of a socket for teardown: aclose() closes whatever it is holding."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _new_generation() -> _ResponseGeneration:
@@ -166,8 +182,13 @@ async def test_input_audio_transcription_delta_accumulates():
 
 
 @pytest.mark.asyncio
-async def test_input_audio_transcription_failed_clears_partial():
-    """A failed transcription drops the partial and does not emit a transcript."""
+async def test_input_audio_transcription_failed_finalizes_the_partial():
+    """A failure closes out the partial as final.
+
+    Captioning has already been handed interim text for this item and has no
+    other way to learn the turn is over; dropping it leaves the last thing the
+    user said on screen as an unfinished partial.
+    """
     session = _make_session()
 
     events: list[llm.InputTranscriptionCompleted] = []
@@ -178,14 +199,38 @@ async def test_input_audio_transcription_failed_clears_partial():
         {"item_id": "item_1", "error": {"message": "boom"}}
     )
 
-    assert events == []
+    assert len(events) == 1
+    assert events[0].transcript == "what's th"
+    assert events[0].is_final is True
     assert "item_1" not in session._input_transcripts
+    # and it lands in history, so the turn isn't missing from the transcript
+    assert session._chat_ctx.items[-1].text_content == "what's th"
 
 
 @pytest.mark.asyncio
-async def test_update_chat_ctx_ignores_non_output_items():
-    """Messages are server-owned; only function outputs are forwarded."""
+async def test_input_audio_transcription_failed_without_a_partial_is_quiet():
     session = _make_session()
+
+    events: list[llm.InputTranscriptionCompleted] = []
+    session.on("input_audio_transcription_completed", events.append)
+
+    session._handle_input_audio_transcription_failed(
+        {"item_id": "item_1", "error": {"message": "boom"}}
+    )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_update_chat_ctx_sends_items_the_provider_does_not_have():
+    """Preloaded history and generate_reply(user_input=...) reach the provider.
+
+    The provider owns the live conversation, but it can only answer what it has
+    been told: a locally recorded user message that is never sent leaves the model
+    replying to nothing.
+    """
+    session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -193,7 +238,48 @@ async def test_update_chat_ctx_ignores_non_output_items():
     chat_ctx.add_message(role="user", content="hello")
 
     await session.update_chat_ctx(chat_ctx)
+
+    ev = session._msg_ch.recv_nowait()
+    assert ev["type"] == "conversation.item.create"
+    assert ev["item"]["role"] == "user"
+    assert ev["item"]["content"] == [{"type": "input_text", "text": "hello"}]
     assert session._msg_ch.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_update_chat_ctx_does_not_echo_back_what_the_model_produced():
+    """The model's own turns are already in its conversation.
+
+    Re-sending them would duplicate the reply it just gave.
+    """
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    session._current_generation = _new_generation()
+    session._handle_response_output_item_added({"item": {"id": "msg_1", "type": "message"}})
+    session._handle_response_text_delta({"item_id": "msg_1", "delta": "hi there"})
+    session._handle_response_output_item_done({"item": {"id": "msg_1", "type": "message"}})
+
+    await session.update_chat_ctx(session.chat_ctx)
+    assert session._msg_ch.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_update_chat_ctx_is_idempotent():
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="user", content="hello")
+
+    await session.update_chat_ctx(chat_ctx)
+    await session.update_chat_ctx(chat_ctx)
+
+    assert session._msg_ch.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -202,6 +288,7 @@ async def test_replay_session_state_resets_and_requeues():
     (not hang), per-turn state resets, and non-default tool_choice is re-applied
     since it rides on session.update rather than session.create."""
     session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -236,6 +323,7 @@ async def test_session_failover_replays_conversation():
     trigger the same replay a reconnect does — otherwise the agent keeps talking
     to a model that has forgotten the call."""
     session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -258,10 +346,48 @@ async def test_session_failover_replays_conversation():
 
 
 @pytest.mark.asyncio
+async def test_failover_mid_reply_is_reported():
+    """The reply stops halfway. Closing its channels quietly would present that to
+    the pipeline as a finished turn, so the caller hears a sentence stop and then
+    silence with nothing saying why."""
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+    session._handle_response_created({"response": {"id": "resp_1"}})
+
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    session._handle_session_failover({"type": "session.failover", "reason": "provider_unavailable"})
+
+    assert len(errors) == 1
+    assert errors[0].recoverable is True
+    assert session._current_generation is None
+
+
+@pytest.mark.asyncio
+async def test_failover_between_turns_is_not_reported():
+    """Nothing was interrupted, so there is nothing to tell the app about."""
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    session._handle_session_failover({"type": "session.failover"})
+
+    assert errors == []
+
+
+@pytest.mark.asyncio
 async def test_session_failover_without_context_loss_is_quiet():
     """context_lost is the whole payload of the notice. A handoff that preserves
     the conversation must not re-send it, or the model sees every turn twice."""
     session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -308,6 +434,7 @@ async def test_sent_fnc_outputs_survives_replay():
 async def test_replay_session_state_default_tool_choice_no_requeue():
     """A default 'auto' tool_choice and no tools produce no replay events."""
     session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -370,6 +497,7 @@ async def test_replay_session_state_rebuilds_conversation():
     """A reconnect (including the proactive recycle at max_session_duration) must
     re-send the conversation, otherwise the agent re-greets a caller mid-call."""
     session = _make_session()
+    session._started = True
     session._connected = True
     session._ws = object()
 
@@ -443,6 +571,322 @@ def test_temperature_is_not_forwarded():
     )
 
     assert not hasattr(model._opts, "temperature")
+
+
+def test_session_accepts_turn_detection_disabled():
+    """AgentActivity always passes this keyword when it opens the session.
+
+    Without it every ordinary AgentSession startup raises TypeError before the
+    socket is even opened.
+    """
+    model = STS(
+        model="openai/gpt-realtime",
+        api_key="test-key",
+        api_secret="test-secret",
+        base_url="https://example.livekit.cloud",
+    )
+
+    assert model.capabilities.turn_detection is True
+    # the pipeline may substitute its own detection because none was asked for
+    assert model.capabilities.can_disable_turn_detection is True
+
+    default_td = model._opts.turn_detection
+    session = model.session(turn_detection_disabled=True)
+    assert session._opts.turn_detection is None
+    # the model's own options are untouched: another session still gets VAD
+    assert model._opts.turn_detection == default_td
+    assert model.session()._opts.turn_detection == default_td
+
+
+def test_explicit_turn_detection_is_not_overridable():
+    """An explicit turn_detection is a decision, not a default for the pipeline to
+    replace. Matches the openai realtime plugin."""
+    model = STS(
+        model="openai/gpt-realtime",
+        api_key="test-key",
+        api_secret="test-secret",
+        base_url="https://example.livekit.cloud",
+        turn_detection={"type": "semantic_vad"},
+    )
+
+    assert model.capabilities.can_disable_turn_detection is False
+
+
+def test_bare_realtime_model_names_are_normalized():
+    """agent.py accepts `llm="gpt-realtime"`, but the gateway only resolves
+    provider-qualified ids, so a bare name has to be qualified here or the session
+    fails to open with "model not found"."""
+    model = STS(
+        model="gpt-realtime",
+        api_key="test-key",
+        api_secret="test-secret",
+        base_url="https://example.livekit.cloud",
+    )
+
+    assert model.model == "openai/gpt-realtime"
+
+
+@pytest.mark.asyncio
+async def test_tools_property_reports_the_tools_in_use():
+    """Per-turn tool overrides save `tools`, swap in their own, then restore.
+
+    Reporting a stale empty list makes that restore wipe the agent's tools for the
+    rest of the call.
+    """
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    async def get_weather() -> str:
+        return "sunny"
+
+    tool = llm.function_tool(get_weather)
+    await session.update_tools([tool])
+
+    assert [t.__name__ for t in session.tools.function_tools.values()] == ["get_weather"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_generate_reply_cancels_upstream():
+    """The provider has not heard about the interruption.
+
+    Left running it produces the reply anyway and speaks it over whatever the
+    caller said instead.
+    """
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    fut = session.generate_reply()
+    [event_id] = session._response_created_futures.keys()
+    while session._msg_ch.qsize():
+        session._msg_ch.recv_nowait()
+
+    fut.cancel()
+    await asyncio.sleep(0)
+
+    assert session._msg_ch.recv_nowait() == {"type": "response.cancel"}
+    assert session._response_created_futures == {}
+
+    # a response.created already in flight is discarded, not announced as a
+    # fresh unprompted turn
+    generations: list[llm.GenerationCreatedEvent] = []
+    session.on("generation_created", generations.append)
+    session._handle_response_created(
+        {"response": {"id": "resp_1", "metadata": {"client_event_id": event_id}}}
+    )
+
+    assert generations == []
+    assert session._current_generation is None
+
+
+@pytest.mark.asyncio
+async def test_aclose_fails_pending_replies():
+    """Otherwise a caller awaiting generate_reply blocks for the full ten-second
+    timeout after the session has already gone away."""
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    session._response_created_futures["evt_1"] = fut
+
+    session._ws = _FakeWS()
+    await session.aclose()
+
+    assert fut.done()
+    assert isinstance(fut.exception(), llm.RealtimeError)
+
+
+@pytest.mark.asyncio
+async def test_failed_response_is_reported():
+    """A rate-limited turn closes its channels like any other, so without an error
+    it is indistinguishable from the model choosing to stay silent."""
+    session = _make_session()
+    session._handle_response_created({"response": {"id": "resp_1"}})
+
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    session._handle_response_done(
+        {
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "status_details": {
+                    "error": {"type": "invalid_request_error", "code": "rate_limit_exceeded"}
+                },
+            }
+        }
+    )
+
+    assert len(errors) == 1
+    assert "rate_limit_exceeded" in str(errors[0].error)
+    assert errors[0].recoverable is True
+    assert session._current_generation is None
+
+
+@pytest.mark.asyncio
+async def test_completed_and_cancelled_responses_are_not_reported():
+    """A cancellation is an interruption the pipeline asked for."""
+    session = _make_session()
+
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    for status in ("completed", "cancelled"):
+        session._handle_response_created({"response": {"id": "resp_1"}})
+        session._handle_response_done({"response": {"id": "resp_1", "status": status}})
+
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_truncate_trims_the_record_to_what_was_heard():
+    """chat_ctx is what gets replayed onto a replacement provider. Recording the
+    whole generated reply would restore words the caller interrupted and never
+    heard, and the model would answer as though it had said them."""
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+    session._current_generation = _new_generation()
+
+    session._handle_response_output_item_added({"item": {"id": "msg_1", "type": "message"}})
+    session._handle_response_text_delta(
+        {"item_id": "msg_1", "delta": "the capital of France is Paris"}
+    )
+
+    session.truncate(
+        message_id="msg_1",
+        audio_end_ms=800,
+        modalities=["audio"],
+        audio_transcript="the capital of France",
+    )
+    session._handle_response_output_item_done({"item": {"id": "msg_1", "type": "message"}})
+
+    assert session.chat_ctx.items[-1].text_content == "the capital of France"
+
+
+@pytest.mark.asyncio
+async def test_truncate_after_the_turn_is_recorded_still_trims():
+    """The pipeline truncates when playback stops, which can land either side of
+    the output_item.done that records the turn."""
+    session = _make_session()
+    session._started = True
+    session._connected = True
+    session._ws = object()
+    session._current_generation = _new_generation()
+
+    session._handle_response_output_item_added({"item": {"id": "msg_1", "type": "message"}})
+    session._handle_response_text_delta({"item_id": "msg_1", "delta": "one two three"})
+    session._handle_response_output_item_done({"item": {"id": "msg_1", "type": "message"}})
+
+    session.truncate(
+        message_id="msg_1", audio_end_ms=300, modalities=["audio"], audio_transcript="one two"
+    )
+
+    assert session.chat_ctx.items[-1].text_content == "one two"
+
+
+@pytest.mark.asyncio
+async def test_requests_made_while_the_socket_is_down_are_not_lost():
+    """A reply started during a reconnect used to be dropped by the send pump and
+    then failed, which reads to the caller as the agent going silent for a turn."""
+    session = _make_session()
+    session._started = True
+    session._connected = False
+    session._ws = None
+
+    session._queue_event({"type": "response.create", "response": {}})
+    session._queue_event({"type": "input_audio_buffer.append", "audio": "…"})
+    send_task = asyncio.create_task(session._send_loop())
+    await asyncio.sleep(0)
+
+    # held, not sent: there is no socket to send them on
+    assert session._msg_ch.qsize() == 0
+
+    session._connected = True
+    session._ws = object()
+    session._replay_session_state()
+
+    replayed = [session._msg_ch.recv_nowait() for _ in range(session._msg_ch.qsize())]
+    assert replayed == [{"type": "response.create", "response": {}}], (
+        "the request is re-queued after the replay; real-time audio from the gap is not"
+    )
+
+    send_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await send_task
+
+
+@pytest.mark.asyncio
+async def test_deferred_requests_land_behind_the_replayed_conversation():
+    """A response.create the provider sees before the history it refers to is
+    answered against an empty conversation."""
+    session = _make_session()
+    session._started = True
+    session._connected = False
+    session._ws = None
+    session._record_item(llm.ChatMessage(id="user_1", role="user", content=["book a table"]))
+
+    session._queue_event({"type": "response.create", "response": {}})
+    send_task = asyncio.create_task(session._send_loop())
+    await asyncio.sleep(0)
+
+    session._connected = True
+    session._ws = object()
+    session._replay_session_state()
+
+    replayed = [session._msg_ch.recv_nowait() for _ in range(session._msg_ch.qsize())]
+    assert [ev["type"] for ev in replayed] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+
+    send_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await send_task
+
+
+def test_error_frames_decode_in_both_shapes():
+    """Provider errors arrive nested as OpenAI sends them; the ones the gateway
+    raises itself are flat. Reading only the nested form reduced every gateway
+    error to the repr of the whole frame and lost the code."""
+    assert _decode_error(
+        {"type": "error", "code": "model_not_found", "message": "no such model"}
+    ) == ("no such model", "model_not_found")
+    assert _decode_error(
+        {"type": "error", "error": {"code": "insufficient_quota", "message": "out of credit"}}
+    ) == ("out of credit", "insufficient_quota")
+    # type stands in for a missing code, as the openai plugin does
+    assert _decode_error({"error": {"type": "invalid_request_error", "message": "bad"}}) == (
+        "bad",
+        "invalid_request_error",
+    )
+    message, code = _decode_error({"type": "error"})
+    assert code == ""
+    assert message  # never empty: falls back to the frame itself
+
+
+@pytest.mark.asyncio
+async def test_fatal_error_codes_are_not_recoverable():
+    """A quota or auth failure fails identically on every later turn, so the
+    session is not worth keeping alive."""
+    session = _make_session()
+
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    session._handle_event(
+        {"type": "error", "code": "insufficient_quota", "message": "out of credit"}
+    )
+    session._handle_event({"type": "error", "code": "server_error", "message": "try again"})
+
+    assert [e.recoverable for e in errors] == [False, True]
 
 
 @pytest.mark.asyncio

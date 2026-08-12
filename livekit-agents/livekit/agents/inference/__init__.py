@@ -8,8 +8,8 @@ from .interruption import (
     OverlappingSpeechEvent,
 )
 from .llm import LLM, LLMModels, LLMStream
+from .sts import STS, STSModels, is_realtime_model
 from .stt import STT, STTModels
-from .sts import STS, STSModels
 from .tts import TTS, TTSModels
 from .vad import VAD, VADModels
 
@@ -48,6 +48,7 @@ __all__ = [
     "InterruptionDetectionError",
     "OverlappingSpeechEvent",
     "InterruptionDataFrameType",
+    "is_realtime_model",
     "TurnDetector",
     "TurnDetectorModels",
     "TurnDetectorVersions",
